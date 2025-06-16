@@ -2,14 +2,29 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"image"
 	"image/png"
 	"log"
 	"net/http"
 	"os"
+	"sync"
 
 	"github.com/disintegration/imaging"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+type User struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+var (
+	userStates     = make(map[int64]string)
+	selectedFrames = make(map[int64]string)
+	userPhotos     = make(map[int64]string)
+	users          = make(map[string]User)
+	usersMutex     = sync.Mutex{}
 )
 
 func main() {
@@ -17,17 +32,15 @@ func main() {
 	if err != nil {
 		log.Panic(err)
 	}
-
 	bot.Debug = true
 	log.Printf("Authorized on account %s", bot.Self.UserName)
+
+	// Start web API
+	go startWebAPI()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
-
-	userStates := make(map[int64]string)
-	selectedFrames := make(map[int64]string)
-	userPhotos := make(map[int64]string)
 
 	for update := range updates {
 		if update.Message == nil && update.CallbackQuery == nil {
@@ -37,6 +50,7 @@ func main() {
 		if update.Message != nil {
 			userID := update.Message.From.ID
 			chatID := update.Message.Chat.ID
+			username := update.Message.From.UserName
 
 			if update.Message.IsCommand() {
 				switch update.Message.Command() {
@@ -44,6 +58,19 @@ func main() {
 					userStates[userID] = ""
 					selectedFrames[userID] = ""
 					userPhotos[userID] = ""
+
+					// Store unique user by username
+					if username != "" {
+						usersMutex.Lock()
+						if _, exists := users[username]; !exists {
+							users[username] = User{
+								ID:       userID,
+								Username: username,
+							}
+							log.Printf("New user added: %s", username)
+						}
+						usersMutex.Unlock()
+					}
 
 					startMsg := tgbotapi.NewMessage(chatID, "👋 Welcome! Click below to start framing your photo:")
 					startMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
@@ -97,7 +124,7 @@ func main() {
 				continue
 			}
 
-			// A frame was selected
+			// Frame selected
 			frame := data
 			selectedFrames[userID] = frame
 			userStates[userID] = "awaiting_photo"
@@ -147,7 +174,6 @@ func processImage(bot *tgbotapi.BotAPI, chatID int64, userID int64, frameName, p
 	}
 
 	userImg = imaging.Fill(userImg, frameImg.Bounds().Dx(), frameImg.Bounds().Dy(), imaging.Center, imaging.Lanczos)
-
 	result := imaging.Overlay(userImg, frameImg, image.Point{0, 0}, 1.0)
 
 	buf := new(bytes.Buffer)
@@ -164,7 +190,7 @@ func processImage(bot *tgbotapi.BotAPI, chatID int64, userID int64, frameName, p
 	msg.Caption = "🎉 Here's your framed photo!"
 	bot.Send(msg)
 
-	// Send "Choose a new frame" button
+	// Send choose again button
 	button := tgbotapi.NewInlineKeyboardButtonData("🔄 Choose a new frame", "choose_frame")
 	markup := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(button),
@@ -173,4 +199,17 @@ func processImage(bot *tgbotapi.BotAPI, chatID int64, userID int64, frameName, p
 	msgWithButton := tgbotapi.NewMessage(chatID, "Want to frame another photo?")
 	msgWithButton.ReplyMarkup = markup
 	bot.Send(msgWithButton)
+}
+
+func startWebAPI() {
+	http.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+		usersMutex.Lock()
+		defer usersMutex.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(users)
+	})
+
+	log.Println("🌐 Web API running at http://localhost:8080/users")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
