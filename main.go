@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/disintegration/imaging"
@@ -28,14 +31,13 @@ var (
 )
 
 func main() {
-	bot, err := tgbotapi.NewBotAPI("7083907588:AAFAELJXy0juEr84mdUp8kNNNo_zuSvGYFc")
+	bot, err := tgbotapi.NewBotAPI("7575675023:AAH0KrU7KMrOXFVrS-ucN5Ofj9XK9_g-Sl8")
 	if err != nil {
 		log.Panic(err)
 	}
 	bot.Debug = true
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
-	// Start web API
 	go startWebAPI()
 
 	u := tgbotapi.NewUpdate(0)
@@ -59,41 +61,105 @@ func main() {
 					selectedFrames[userID] = ""
 					userPhotos[userID] = ""
 
-					// Store unique user by username
 					if username != "" {
 						usersMutex.Lock()
 						if _, exists := users[username]; !exists {
-							users[username] = User{
-								ID:       userID,
-								Username: username,
-							}
+							users[username] = User{ID: userID, Username: username}
 							log.Printf("New user added: %s", username)
 						}
 						usersMutex.Unlock()
 					}
 
-					startMsg := tgbotapi.NewMessage(chatID, "👋 Welcome! Click below to start framing your photo:")
+					startMsg := tgbotapi.NewMessage(chatID, "👋 សូមស្វាគមន៍!\n\nមកកាន់កម្មវិធីបង្កើតរូបភាពស៊ុមរបស់យើង។\n\nសូមជ្រើសរើសស៊ុមដើម្បីចាប់ផ្តើម។")
 					startMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 						tgbotapi.NewInlineKeyboardRow(
 							tgbotapi.NewInlineKeyboardButtonData("🎬 Start Framing", "choose_frame"),
 						),
 					)
 					bot.Send(startMsg)
+
+				case "upload_image":
+					userStates[userID] = "uploading_frame"
+					bot.Send(tgbotapi.NewMessage(chatID, "📤 សូមផ្ញើរូបភាព PNG/JPG ជាមួយចំណងជើង (ឈ្មោះស៊ុម)។"))
 				}
 			}
 
-			if len(update.Message.Photo) > 0 && userStates[userID] == "awaiting_photo" {
-				photo := update.Message.Photo[len(update.Message.Photo)-1]
-				userPhotos[userID] = photo.FileID
-				userStates[userID] = "photo_uploaded"
+			// Handle uploaded photo or image document
+			if len(update.Message.Photo) > 0 || update.Message.Document != nil {
+				state := userStates[userID]
 
-				bot.Send(tgbotapi.NewMessage(chatID, "🖼 Processing your photo..."))
-				processImage(bot, chatID, userID, selectedFrames[userID], photo.FileID)
+				var fileID, fileName string
+				var isImage bool
 
-				userStates[userID] = ""
-				selectedFrames[userID] = ""
-			} else if userStates[userID] == "awaiting_photo" {
-				bot.Send(tgbotapi.NewMessage(chatID, "📸 Please upload a photo."))
+				if update.Message.Document != nil {
+					doc := update.Message.Document
+					if strings.HasPrefix(doc.MimeType, "image/") {
+						fileID = doc.FileID
+						fileName = doc.FileName
+						isImage = true
+					}
+				} else {
+					photo := update.Message.Photo[len(update.Message.Photo)-1]
+					fileID = photo.FileID
+					fileName = update.Message.Caption + ".png"
+					isImage = true
+				}
+
+				if !isImage {
+					bot.Send(tgbotapi.NewMessage(chatID, "❌ Only image files are allowed."))
+					continue
+				}
+
+				switch state {
+				case "uploading_frame":
+					file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+					if err != nil {
+						bot.Send(tgbotapi.NewMessage(chatID, "❌ Failed to get file."))
+						break
+					}
+
+					resp, err := http.Get(file.Link(bot.Token))
+					if err != nil {
+						bot.Send(tgbotapi.NewMessage(chatID, "❌ Failed to download frame image."))
+						break
+					}
+					defer resp.Body.Close()
+
+					os.MkdirAll("frame", os.ModePerm)
+
+					frameName := strings.TrimSpace(update.Message.Caption)
+					if frameName == "" {
+						frameName = strings.TrimSuffix(fileName, ".png")
+					}
+					savePath := fmt.Sprintf("frame/%s.png", frameName)
+
+					outFile, err := os.Create(savePath)
+					if err != nil {
+						bot.Send(tgbotapi.NewMessage(chatID, "❌ Failed to save frame image."))
+						break
+					}
+					defer outFile.Close()
+
+					_, err = io.Copy(outFile, resp.Body)
+					if err != nil {
+						bot.Send(tgbotapi.NewMessage(chatID, "❌ Failed to write image to file."))
+						break
+					}
+
+					bot.Send(tgbotapi.NewMessage(chatID, "✅ ស៊ុមបានបង្ហោះដោយជោគជ័យ `"+savePath+"`"))
+					userStates[userID] = ""
+
+				case "awaiting_photo":
+					userPhotos[userID] = fileID
+					userStates[userID] = "photo_uploaded"
+					bot.Send(tgbotapi.NewMessage(chatID, "🖼 កំពុងដំណើរការរូបភាពរបស់អ្នក..."))
+					processImage(bot, chatID, userID, selectedFrames[userID], fileID)
+					userStates[userID] = ""
+					selectedFrames[userID] = ""
+
+				default:
+					bot.Send(tgbotapi.NewMessage(chatID, "🤖 Not expecting a file right now."))
+				}
 			}
 		}
 
@@ -108,15 +174,16 @@ func main() {
 				userPhotos[userID] = ""
 
 				bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "🔄 Choose a frame"))
-				bot.Send(tgbotapi.NewMessage(chatID, "👋 Please choose a frame:"))
+				bot.Send(tgbotapi.NewMessage(chatID, "👋 សូម​ជ្រើសរើស​ស៊ុម:"))
 
-				frames := []string{"frame1", "frame2", "frame3"}
-				for _, frame := range frames {
-					photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(frame+".png"))
-					photo.Caption = "Frame Preview: " + frame
+				files, _ := os.ReadDir("frame")
+				for _, f := range files {
+					frameName := strings.TrimSuffix(f.Name(), ".png")
+					photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath("frame/"+f.Name()))
+					photo.Caption = "Frame Preview: " + frameName
 					photo.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 						tgbotapi.NewInlineKeyboardRow(
-							tgbotapi.NewInlineKeyboardButtonData("Use this frame", frame),
+							tgbotapi.NewInlineKeyboardButtonData("Use this frame", frameName),
 						),
 					)
 					bot.Send(photo)
@@ -124,13 +191,11 @@ func main() {
 				continue
 			}
 
-			// Frame selected
-			frame := data
-			selectedFrames[userID] = frame
+			// frame selected
+			selectedFrames[userID] = data
 			userStates[userID] = "awaiting_photo"
-
-			bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "✅ You selected "+frame))
-			bot.Send(tgbotapi.NewMessage(chatID, "Now please upload your photo 📷"))
+			bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, "✅ You selected "+data))
+			bot.Send(tgbotapi.NewMessage(chatID, "ឥឡូវ​នេះ សូម​បង្ហោះ​រូបថត​របស់​អ្នក 📷"))
 		}
 	}
 }
@@ -158,7 +223,7 @@ func processImage(bot *tgbotapi.BotAPI, chatID int64, userID int64, frameName, p
 		return
 	}
 
-	frameFile, err := os.Open(frameName + ".png")
+	frameFile, err := os.Open("frame/" + frameName + ".png")
 	if err != nil {
 		log.Println("Error opening frame image:", err)
 		bot.Send(tgbotapi.NewMessage(chatID, "❌ Failed to open frame image."))
@@ -187,16 +252,15 @@ func processImage(bot *tgbotapi.BotAPI, chatID int64, userID int64, frameName, p
 		Name:  "framed_photo.png",
 		Bytes: buf.Bytes(),
 	})
-	msg.Caption = "🎉 Here's your framed photo!"
+	msg.Caption = "🎉 នេះជារូបថតស៊ុមរបស់អ្នក!"
 	bot.Send(msg)
 
-	// Send choose again button
-	button := tgbotapi.NewInlineKeyboardButtonData("🔄 Choose a new frame", "choose_frame")
+	button := tgbotapi.NewInlineKeyboardButtonData("🔄 ជ្រើសរើសស៊ុមថ្មី", "choose_frame")
 	markup := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(button),
 	)
 
-	msgWithButton := tgbotapi.NewMessage(chatID, "Want to frame another photo?")
+	msgWithButton := tgbotapi.NewMessage(chatID, "តើអ្នកចង់ជ្រើសរើសស៊ុមថ្មីមែនទេ?")
 	msgWithButton.ReplyMarkup = markup
 	bot.Send(msgWithButton)
 }
